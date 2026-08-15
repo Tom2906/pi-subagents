@@ -149,7 +149,7 @@ function steerInputOf(panel: FleetWebPanel): Extract<FleetWebNode, { type: "inpu
  *  multibyte UTF-8, roster at the conservative cap, all notices present. */
 function worstCaseProjection(): FleetWebPanel {
 	const ascii = (count: number) => "x".repeat(count);
-	const multibyte = (count: number) => "界".repeat(count); // 3 UTF-8 bytes per character
+	const multibyte = (count: number) => "😀".repeat(count); // 4 UTF-8 bytes per character
 	const roster = Array.from({ length: FLEET_WEB_CAPS.maxRosterItems }, () => ({
 		id: ascii(200),
 		title: ascii(200),
@@ -208,7 +208,7 @@ describe("fleet web projection", () => {
 		assert.ok(metricLabels.includes("Source"));
 		assert.ok(metricLabels.includes("Model"));
 		assert.ok(metricLabels.includes("Runtime"));
-		assert.equal(textOf(panel)?.content, "◆ Assistant\n  progress so far");
+		assert.equal(textOf(panel)?.content, "◆ Assistant  progress so far");
 		assert.equal(textOf(panel)?.log, true);
 		assert.equal(steerInputOf(panel)?.id, FLEET_WEB_ACTION_STEER);
 		const actions = actionsOf(panel);
@@ -378,6 +378,25 @@ describe("fleet web projection", () => {
 		assert.equal(listOf(panel).selectedId, item.id, "selected id must match the capped roster id");
 	});
 
+	it("sanitizes every extension-controlled projection string", () => {
+		const hostile = "\x1b[31mred\x1b[0m\x00\x08\n\r\u009b31m";
+		const panel = projectFleetWebPanel(baseInput({
+			roster: [{ id: hostile, title: hostile, subtitle: hostile, status: hostile }], selectedId: hostile,
+			scanError: hostile, emptyMessage: hostile,
+			detail: { title: hostile, metrics: [{ label: hostile, value: hostile, detail: hostile }], transcriptTail: hostile, transcriptWarning: hostile },
+			actionState: { busy: false, stopConfirming: true, expandedTools: false, hasControls: false, controlsReason: hostile, stopConfirmMessage: hostile, notice: { text: hostile, isError: true } },
+		}));
+		const strings: string[] = [];
+		const collect = (value: unknown): void => {
+			if (typeof value === "string") strings.push(value);
+			else if (Array.isArray(value)) value.forEach(collect);
+			else if (value && typeof value === "object") Object.values(value).forEach(collect);
+		};
+		collect(JSON.parse(JSON.stringify(panel)));
+		assert.ok(strings.every((value) => !/[\x00-\x1F\x7F-\x9F]/.test(value)), "no control byte may occur anywhere in JSON projection");
+		assert.ok(strings.some((value) => value.includes("red")), "sanitization retains printable content");
+	});
+
 	it("caps the final composed prefixed notice instead of fragments", () => {
 		const panel = projectFleetWebPanel(baseInput({
 			scanError: "e".repeat(5000),
@@ -404,7 +423,7 @@ describe("fleet web projection", () => {
 		const panel = worstCaseProjection();
 		const serialized = JSON.stringify(panel);
 		const bytes = new TextEncoder().encode(serialized).length;
-		assert.ok(bytes < 64 * 1024, `worst-case projection must stay under 64 KiB (actual ${bytes} bytes)`);
+		assert.ok(bytes <= 64 * 1024, `worst-case projection must stay under 64 KiB (actual ${bytes} bytes)`);
 	});
 
 	it("validates representative fixtures through Pi Web's exact validator when available locally", async () => {

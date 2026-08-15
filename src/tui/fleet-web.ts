@@ -15,9 +15,11 @@ export const FLEET_WEB_CAPS = {
 	/** Conservative notice cap (final composed message): keeps the full
 	 *  worst-case projection below the WebPanel payload byte cap even with
 	 *  several prefixed notices present at once. */
-	maxNoticeLength: 2000,
-	/** Conservative roster cap: 36 fully-capped items plus a full detail pane
-	 *  stay below the 64 KiB WebPanel payload limit with headroom. */
+	maxNoticeLength: 1000,
+	/** Keep the non-optional metric portion small enough that a panel remains
+	 *  serializable even when every character uses four UTF-8 bytes. */
+	maxMetricItems: 8,
+	/** Conservative roster cap; the final byte guard may reduce it further. */
 	maxRosterItems: 36,
 	maxTailChars: 3500,
 	maxTailLines: 120,
@@ -89,9 +91,28 @@ const ANSI_PATTERN = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\d/#&.:=?%@~
 /** C0/C1 control characters left over after escape-sequence stripping (tabs,
  *  newlines and carriage returns are legitimate content). */
 const CONTROL_PATTERN = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x80-\x9F]/g;
+const ALL_CONTROL_PATTERN = /[\x00-\x1F\x7F-\x9F]/g;
 
 export function stripAnsi(value: string): string {
 	return value.replace(ANSI_PATTERN, "").replace(CONTROL_PATTERN, "");
+}
+
+/** Every extension-controlled string passes through one of these before it is
+ * placed in the projection. Static UI copy intentionally does not need it. */
+function cleanLabel(value: string): string {
+	return capLabel(stripAnsi(value).replace(ALL_CONTROL_PATTERN, ""));
+}
+
+function cleanText(value: string): string {
+	return capText(stripAnsi(value).replace(ALL_CONTROL_PATTERN, ""));
+}
+
+function cleanNotice(value: string): string {
+	return capNotice(stripAnsi(value).replace(ALL_CONTROL_PATTERN, ""));
+}
+
+function serializedBytes(panel: FleetWebPanel): number {
+	return new TextEncoder().encode(JSON.stringify(panel)).length;
 }
 
 // ---------------------------------------------------------------------------
@@ -277,24 +298,34 @@ export function projectFleetWebPanel(input: FleetWebPanelInput): FleetWebPanel {
 	const detailChildren: FleetWebNode[] = [];
 	// Prefixed notices are capped on the FINAL composed message so the prefix
 	// can never push the notice over the limit.
-	if (input.scanError) detailChildren.push(notice("warning", capNotice(`Fleet scan warning: ${input.scanError}`)));
+	if (input.scanError) detailChildren.push(notice("warning", cleanNotice(`Fleet scan warning: ${input.scanError}`)));
 	if (!input.detail) {
-		detailChildren.push(notice("info", capNotice(input.emptyMessage ?? "No current-session foreground or recent async children.")));
+		detailChildren.push(notice("info", input.emptyMessage === undefined
+			? "No current-session foreground or recent async children."
+			: cleanNotice(input.emptyMessage)));
 		detailChildren.push({ type: "actions", items: actionItems({ ...input.actionState, hasControls: false }, false) });
 	} else {
-		if (input.detail.metrics.length > 0) detailChildren.push({ type: "metrics", items: input.detail.metrics });
-		if (input.detail.transcriptWarning) detailChildren.push(notice("warning", capNotice(input.detail.transcriptWarning)));
+		if (input.detail.metrics.length > 0) detailChildren.push({ type: "metrics", items: input.detail.metrics.slice(0, FLEET_WEB_CAPS.maxMetricItems).map((item) => ({
+			label: cleanLabel(item.label),
+			value: cleanLabel(item.value),
+			...(item.detail !== undefined ? { detail: cleanLabel(item.detail) } : {}),
+		})) });
+		if (input.detail.transcriptWarning) detailChildren.push(notice("warning", cleanNotice(input.detail.transcriptWarning)));
 		if (input.actionState.busy) detailChildren.push(notice("info", "Action pending…"));
 		if (input.actionState.notice) {
-			detailChildren.push(notice(input.actionState.notice.isError ? "error" : "success", capNotice(input.actionState.notice.text)));
+			detailChildren.push(notice(input.actionState.notice.isError ? "error" : "success", cleanNotice(input.actionState.notice.text)));
 		}
 		if (input.actionState.stopConfirming) {
-			detailChildren.push(notice("warning", capNotice(input.actionState.stopConfirmMessage ?? "Confirm stop for the selected run? Stop ends the run; use interrupt for a resumable pause.")));
+			detailChildren.push(notice("warning", input.actionState.stopConfirmMessage === undefined
+				? "Confirm stop for the selected run? Stop ends the run; use interrupt for a resumable pause."
+				: cleanNotice(input.actionState.stopConfirmMessage)));
 		} else if (!input.actionState.hasControls && input.actionState.controlsReason) {
-			detailChildren.push(notice("info", capNotice(input.actionState.controlsReason)));
+			detailChildren.push(notice("info", cleanNotice(input.actionState.controlsReason)));
 		}
 		if (input.detail.transcriptTail !== undefined) {
-			detailChildren.push({ type: "text", content: input.detail.transcriptTail || "(no transcript available)", log: true });
+			detailChildren.push({ type: "text", content: input.detail.transcriptTail === undefined || input.detail.transcriptTail === ""
+				? "(no transcript available)"
+				: cleanText(input.detail.transcriptTail), log: true });
 		}
 		// The steer input is omitted entirely while an action is pending.
 		if (input.actionState.hasControls && !input.actionState.stopConfirming && !input.actionState.busy) {
@@ -306,26 +337,34 @@ export function projectFleetWebPanel(input: FleetWebPanelInput): FleetWebPanel {
 	// Roster ids/titles/subtitles/statuses are capped and the roster itself is
 	// clipped to a conservative item count so the serialized projection always
 	// stays within the WebPanel payload byte cap.
-	const roster = input.roster.slice(0, FLEET_WEB_CAPS.maxRosterItems).map((item) => ({
-		id: capLabel(item.id),
-		title: capLabel(item.title),
-		...(item.subtitle !== undefined ? { subtitle: capLabel(item.subtitle) } : {}),
-		...(item.status !== undefined ? { status: capLabel(item.status) } : {}),
+	const cappedSelected = input.selectedId !== undefined ? cleanLabel(input.selectedId) : undefined;
+	const rawRoster = input.roster.map((item) => ({
+		id: cleanLabel(item.id), title: cleanLabel(item.title),
+		...(item.subtitle !== undefined ? { subtitle: cleanLabel(item.subtitle) } : {}),
+		...(item.status !== undefined ? { status: cleanLabel(item.status) } : {}),
 	}));
-	const cappedSelected = input.selectedId !== undefined ? capLabel(input.selectedId) : undefined;
-	const selectedId = cappedSelected !== undefined && roster.some((item) => item.id === cappedSelected)
-		? cappedSelected
-		: undefined;
-	return {
-		version: FLEET_WEB_VERSION,
-		title: "Subagent fleet",
-		layout: "workspace",
-		root: {
-			type: "section",
-			children: [
-				{ type: "list", items: roster, ...(selectedId !== undefined ? { selectedId } : {}) },
-				{ type: "detail", ...(input.detail?.title ? { title: capLabel(input.detail.title) } : {}), children: detailChildren },
-			],
-		},
+	// Put the selected row first before clipping, preserving it whenever it is
+	// present even if a pathological roster must be shortened.
+	const selectedItem = cappedSelected === undefined ? undefined : rawRoster.find((item) => item.id === cappedSelected);
+	const roster = [
+		...(selectedItem ? [selectedItem] : []),
+		...rawRoster.filter((item) => item !== selectedItem),
+	].slice(0, FLEET_WEB_CAPS.maxRosterItems);
+	const selectedId = selectedItem ? cappedSelected : undefined;
+	const panel: FleetWebPanel = {
+		version: FLEET_WEB_VERSION, title: "Subagent fleet", layout: "workspace",
+		root: { type: "section", children: [
+			{ type: "list", items: roster, ...(selectedId !== undefined ? { selectedId } : {}) },
+			{ type: "detail", ...(input.detail?.title ? { title: cleanLabel(input.detail.title) } : {}), children: detailChildren },
+		] },
 	};
+	// The WebPanel cap is UTF-8 bytes, not JS character count. Transcript and
+	// unselected roster rows are optional, so remove them until serialization
+	// fits while retaining valid JSON and the selected worker when possible.
+	const list = panel.root.children[0] as Extract<FleetWebNode, { type: "list" }>;
+	const detail = panel.root.children[1] as Extract<FleetWebNode, { type: "detail" }>;
+	const textIndex = detail.children?.findIndex((child) => child.type === "text") ?? -1;
+	if (textIndex >= 0 && serializedBytes(panel) > 64 * 1024) detail.children?.splice(textIndex, 1);
+	while (serializedBytes(panel) > 64 * 1024 && list.items.length > (selectedId === undefined ? 0 : 1)) list.items.pop();
+	return panel;
 }
