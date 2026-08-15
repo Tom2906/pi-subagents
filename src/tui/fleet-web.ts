@@ -12,7 +12,13 @@ export const FLEET_WEB_VERSION = 1;
 export const FLEET_WEB_CAPS = {
 	maxLabelLength: 200,
 	maxTextLength: 4000,
-	maxRosterItems: 100,
+	/** Conservative notice cap (final composed message): keeps the full
+	 *  worst-case projection below the WebPanel payload byte cap even with
+	 *  several prefixed notices present at once. */
+	maxNoticeLength: 2000,
+	/** Conservative roster cap: 36 fully-capped items plus a full detail pane
+	 *  stay below the 64 KiB WebPanel payload limit with headroom. */
+	maxRosterItems: 36,
 	maxTailChars: 3500,
 	maxTailLines: 120,
 } as const;
@@ -73,11 +79,19 @@ export function capText(value: string): string {
 	return value.length <= FLEET_WEB_CAPS.maxTextLength ? value : `${value.slice(0, FLEET_WEB_CAPS.maxTextLength - 1)}…`;
 }
 
+/** Cap the final composed notice message to the projection's notice cap. */
+export function capNotice(value: string): string {
+	return value.length <= FLEET_WEB_CAPS.maxNoticeLength ? value : `${value.slice(0, FLEET_WEB_CAPS.maxNoticeLength - 1)}…`;
+}
+
 /** Strip ANSI/terminal escape sequences so no control codes cross the wire. */
 const ANSI_PATTERN = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*|[a-zA-Z\d]+(?:;[-a-zA-Z\d/#&.:=?%@~_]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
+/** C0/C1 control characters left over after escape-sequence stripping (tabs,
+ *  newlines and carriage returns are legitimate content). */
+const CONTROL_PATTERN = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x80-\x9F]/g;
 
 export function stripAnsi(value: string): string {
-	return value.replace(ANSI_PATTERN, "");
+	return value.replace(ANSI_PATTERN, "").replace(CONTROL_PATTERN, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -92,29 +106,18 @@ export interface FleetWebTailOptions {
 	maxLines?: number;
 }
 
-interface MutableTail {
-	lines: string[];
-	chars: number;
-	maxChars: number;
-	maxLines: number;
-}
-
-function tailPush(tail: MutableTail, text: string): void {
-	if (tail.lines.length >= tail.maxLines) return;
-	const next = tail.chars + text.length + 1;
-	if (next > tail.maxChars) return;
-	tail.lines.push(text);
-	tail.chars = next;
-}
-
 function eventTailLines(event: FleetTranscriptEvent, expandedTools: boolean): string[] {
 	if (event.kind === "tool") {
 		const status = event.status === "running" ? "running" : event.status === "error" ? "error" : "done";
-		const lines = [`● ${event.name}${event.args ? ` ${event.args}` : ""} (${status})`];
+		// Tool name, args and error are transcript-derived: strip ANSI/control
+		// sequences so a malicious transcript cannot smuggle them into the UI.
+		const name = stripAnsi(event.name);
+		const args = event.args ? ` ${stripAnsi(event.args)}` : "";
+		const lines = [`● ${name}${args} (${status})`];
+		// Command output is only surfaced when tools are expanded; the collapsed
+		// view must not leak tool output (including bash output).
 		if (expandedTools && event.output) {
 			for (const outputLine of stripAnsi(event.output).replace(/\s+$/, "").split(/\r?\n/).slice(-8)) lines.push(`  ${outputLine}`);
-		} else if (event.name === "bash" && event.output) {
-			for (const outputLine of stripAnsi(event.output).replace(/\s+$/, "").split(/\r?\n/).slice(-2)) lines.push(`  ${outputLine}`);
 		}
 		if (event.error && event.status === "error") {
 			for (const errorLine of stripAnsi(event.error).split(/\r?\n/).slice(0, 3)) lines.push(`  ! ${errorLine}`);
@@ -134,21 +137,72 @@ function eventTailLines(event: FleetTranscriptEvent, expandedTools: boolean): st
 	return [stripAnsi(event.text)];
 }
 
+function groupCharCount(group: string[]): number {
+	return group.reduce((sum, line) => sum + line.length, 0);
+}
+
 /**
  * Build a bounded, plain-text, ANSI-free transcript tail for the web detail
  * pane. Message text is already clipped by readFleetTranscript; this function
- * additionally bounds lines and characters.
+ * additionally bounds lines and characters and always selects the NEWEST
+ * activity first, so a busy transcript shows current work rather than stale
+ * retained output. Included event groups keep their chronological order;
+ * anything that cannot fit is dropped and visibly marked as omitted.
  */
 export function plainTranscriptTail(transcript: FleetTranscript, options: FleetWebTailOptions = {}): string {
 	const maxChars = Math.max(1, options.maxChars ?? FLEET_WEB_CAPS.maxTailChars);
 	const maxLines = Math.max(1, options.maxLines ?? FLEET_WEB_CAPS.maxTailLines);
 	const expandedTools = options.expandedTools === true;
-	const tail: MutableTail = { lines: [], chars: 0, maxChars, maxLines };
-	if (transcript.truncated) tailPush(tail, "↑ Earlier activity omitted");
-	for (const event of transcript.events) {
-		for (const line of eventTailLines(event, expandedTools)) tailPush(tail, line);
+	const marker = "↑ Earlier activity omitted";
+
+	const eventGroups = transcript.events.map((event) => eventTailLines(event, expandedTools));
+
+	// Reserve budget for the omission marker whenever it can be rendered; the
+	// selection below always keeps the final text within both caps.
+	const markerFits = 1 <= maxLines && marker.length + 1 <= maxChars;
+	const contentMaxLines = maxLines - (markerFits ? 1 : 0);
+	const contentMaxChars = maxChars - (markerFits ? marker.length + 1 : 0);
+
+	// Select newest event groups first. Included groups stay in chronological
+	// order; an oversized newest event keeps only its newest fitting lines so
+	// the tail is never blanked by a single huge record.
+	const kept: string[][] = [];
+	let keptLines = 0;
+	let keptChars = 0;
+	for (let index = eventGroups.length - 1; index >= 0; index--) {
+		const group = eventGroups[index];
+		const groupChars = groupCharCount(group);
+		const fitsWhole = keptLines + group.length <= contentMaxLines
+			&& keptChars + groupChars + keptLines + group.length - 1 <= contentMaxChars;
+		if (fitsWhole) {
+			kept.unshift(group);
+			keptLines += group.length;
+			keptChars += groupChars;
+			continue;
+		}
+		const partial: string[] = [];
+		let partialChars = 0;
+		for (let lineIndex = group.length - 1; lineIndex >= 0; lineIndex--) {
+			const line = group[lineIndex];
+			if (keptLines + partial.length + 1 > contentMaxLines
+				|| keptChars + partialChars + line.length + keptLines + partial.length > contentMaxChars) break;
+			partial.push(line);
+			partialChars += line.length;
+		}
+		if (partial.length > 0) {
+			kept.unshift(partial.reverse());
+			keptLines += partial.length;
+			keptChars += partialChars;
+			break;
+		}
+		// No line of this group fits at all (oversized single record); keep
+		// scanning older activity so the tail is never blanked.
 	}
-	return tail.lines.join("\n");
+
+	const droppedEarlier = keptLines < eventGroups.reduce((sum, group) => sum + group.length, 0);
+	const emitMarker = markerFits && (transcript.truncated || droppedEarlier);
+	const parts = emitMarker ? [marker, ...kept.flat()] : kept.flat();
+	return parts.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -193,18 +247,21 @@ function notice(tone: FleetWebTone, message: string): Extract<FleetWebNode, { ty
 }
 
 function actionItems(state: FleetWebActionState, hasSelection: boolean): FleetWebActionItem[] {
+	// While an action is pending, every control is disabled so no overlapping
+	// action can be triggered from the projection.
+	const busyDisabled = state.busy ? { disabled: true } : {};
 	if (state.stopConfirming) {
 		return [
-			{ id: FLEET_WEB_ACTION_STOP_CANCEL, label: "Cancel", kind: "secondary" },
-			{ id: FLEET_WEB_ACTION_STOP_CONFIRM, label: "Confirm stop", kind: "danger" },
+			{ id: FLEET_WEB_ACTION_STOP_CANCEL, label: "Cancel", kind: "secondary", ...busyDisabled },
+			{ id: FLEET_WEB_ACTION_STOP_CONFIRM, label: "Confirm stop", kind: "danger", ...busyDisabled },
 		];
 	}
 	const items: FleetWebActionItem[] = [
-		{ id: FLEET_WEB_ACTION_REFRESH, label: "Refresh", kind: "secondary" },
-		{ id: FLEET_WEB_ACTION_TOOLS, label: state.expandedTools ? "Collapse tool output" : "Expand tool output", kind: "secondary" },
+		{ id: FLEET_WEB_ACTION_REFRESH, label: "Refresh", kind: "secondary", ...busyDisabled },
+		{ id: FLEET_WEB_ACTION_TOOLS, label: state.expandedTools ? "Collapse tool output" : "Expand tool output", kind: "secondary", ...busyDisabled },
 	];
 	if (state.hasControls) {
-		items.push({ id: FLEET_WEB_ACTION_STOP, label: "Stop", kind: "danger" });
+		items.push({ id: FLEET_WEB_ACTION_STOP, label: "Stop", kind: "danger", ...busyDisabled });
 	} else if (hasSelection) {
 		items.push({ id: FLEET_WEB_ACTION_STOP, label: "Stop", kind: "danger", disabled: true });
 	}
@@ -218,34 +275,46 @@ function actionItems(state: FleetWebActionState, hasSelection: boolean): FleetWe
  */
 export function projectFleetWebPanel(input: FleetWebPanelInput): FleetWebPanel {
 	const detailChildren: FleetWebNode[] = [];
-	if (input.scanError) detailChildren.push(notice("warning", `Fleet scan warning: ${capText(input.scanError)}`));
+	// Prefixed notices are capped on the FINAL composed message so the prefix
+	// can never push the notice over the limit.
+	if (input.scanError) detailChildren.push(notice("warning", capNotice(`Fleet scan warning: ${input.scanError}`)));
 	if (!input.detail) {
-		detailChildren.push(notice("info", capText(input.emptyMessage ?? "No current-session foreground or recent async children.")));
+		detailChildren.push(notice("info", capNotice(input.emptyMessage ?? "No current-session foreground or recent async children.")));
 		detailChildren.push({ type: "actions", items: actionItems({ ...input.actionState, hasControls: false }, false) });
 	} else {
 		if (input.detail.metrics.length > 0) detailChildren.push({ type: "metrics", items: input.detail.metrics });
-		if (input.detail.transcriptWarning) detailChildren.push(notice("warning", capText(input.detail.transcriptWarning)));
+		if (input.detail.transcriptWarning) detailChildren.push(notice("warning", capNotice(input.detail.transcriptWarning)));
 		if (input.actionState.busy) detailChildren.push(notice("info", "Action pending…"));
 		if (input.actionState.notice) {
-			detailChildren.push(notice(input.actionState.notice.isError ? "error" : "success", capText(input.actionState.notice.text)));
+			detailChildren.push(notice(input.actionState.notice.isError ? "error" : "success", capNotice(input.actionState.notice.text)));
 		}
 		if (input.actionState.stopConfirming) {
-			detailChildren.push(notice("warning", capText(input.actionState.stopConfirmMessage ?? "Confirm stop for the selected run? Stop ends the run; use interrupt for a resumable pause.")));
+			detailChildren.push(notice("warning", capNotice(input.actionState.stopConfirmMessage ?? "Confirm stop for the selected run? Stop ends the run; use interrupt for a resumable pause.")));
 		} else if (!input.actionState.hasControls && input.actionState.controlsReason) {
-			detailChildren.push(notice("info", capText(input.actionState.controlsReason)));
+			detailChildren.push(notice("info", capNotice(input.actionState.controlsReason)));
 		}
 		if (input.detail.transcriptTail !== undefined) {
 			detailChildren.push({ type: "text", content: input.detail.transcriptTail || "(no transcript available)", log: true });
 		}
-		if (input.actionState.hasControls && !input.actionState.stopConfirming) {
+		// The steer input is omitted entirely while an action is pending.
+		if (input.actionState.hasControls && !input.actionState.stopConfirming && !input.actionState.busy) {
 			detailChildren.push({ type: "input", id: FLEET_WEB_ACTION_STEER, label: "Steer message", placeholder: "Message to the selected worker", submitLabel: "Send" });
 		}
 		detailChildren.push({ type: "actions", items: actionItems(input.actionState, true) });
 	}
 
-	const roster = input.roster.slice(0, FLEET_WEB_CAPS.maxRosterItems);
-	const selectedId = input.selectedId !== undefined && roster.some((item) => item.id === input.selectedId)
-		? input.selectedId
+	// Roster ids/titles/subtitles/statuses are capped and the roster itself is
+	// clipped to a conservative item count so the serialized projection always
+	// stays within the WebPanel payload byte cap.
+	const roster = input.roster.slice(0, FLEET_WEB_CAPS.maxRosterItems).map((item) => ({
+		id: capLabel(item.id),
+		title: capLabel(item.title),
+		...(item.subtitle !== undefined ? { subtitle: capLabel(item.subtitle) } : {}),
+		...(item.status !== undefined ? { status: capLabel(item.status) } : {}),
+	}));
+	const cappedSelected = input.selectedId !== undefined ? capLabel(input.selectedId) : undefined;
+	const selectedId = cappedSelected !== undefined && roster.some((item) => item.id === cappedSelected)
+		? cappedSelected
 		: undefined;
 	return {
 		version: FLEET_WEB_VERSION,

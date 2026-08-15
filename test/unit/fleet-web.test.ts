@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 import { SubagentFleetComponent } from "../../src/tui/fleet.ts";
 import { readFleetTranscript } from "../../src/tui/fleet-transcript.ts";
 import {
 	capLabel,
+	capNotice,
 	capText,
 	FLEET_WEB_ACTION_REFRESH,
 	FLEET_WEB_ACTION_STEER,
@@ -143,6 +145,49 @@ function steerInputOf(panel: FleetWebPanel): Extract<FleetWebNode, { type: "inpu
 	return (detailOf(panel).children ?? []).find((child): child is Extract<FleetWebNode, { type: "input" }> => child.type === "input");
 }
 
+/** Representative worst case: every string at its cap, free text in
+ *  multibyte UTF-8, roster at the conservative cap, all notices present. */
+function worstCaseProjection(): FleetWebPanel {
+	const ascii = (count: number) => "x".repeat(count);
+	const multibyte = (count: number) => "界".repeat(count); // 3 UTF-8 bytes per character
+	const roster = Array.from({ length: FLEET_WEB_CAPS.maxRosterItems }, () => ({
+		id: ascii(200),
+		title: ascii(200),
+		subtitle: ascii(200),
+		status: ascii(200),
+	}));
+	return projectFleetWebPanel({
+		roster,
+		selectedId: roster[0].id,
+		scanError: "scan " + ascii(2000),
+		detail: {
+			title: ascii(200),
+			metrics: Array.from({ length: 9 }, () => ({ label: ascii(200), value: ascii(200), detail: ascii(200) })),
+			transcriptTail: multibyte(3000) + ascii(500),
+			transcriptWarning: "warn " + multibyte(2000),
+		},
+		actionState: {
+			busy: true,
+			stopConfirming: true,
+			expandedTools: true,
+			hasControls: true,
+			stopConfirmMessage: "confirm " + ascii(2000),
+			notice: { text: ascii(2000), isError: true },
+		},
+	});
+}
+
+/** Locate Pi Web's exact validateWebPanel source for the opt-in fixture test.
+ *  Only used when the sibling worktree exists; never a runtime dependency. */
+function piWebValidatorPath(): string | undefined {
+	const candidates = [
+		process.env.PI_WEB_VALIDATOR,
+		"C:/Dev/Worktrees/pi-web/main-driver-release/lib/web-panel.ts",
+		"C:/Dev/Worktrees/pi-web/lib/web-panel.ts",
+	].filter((candidate): candidate is string => typeof candidate === "string");
+	return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
 describe("fleet web projection", () => {
 	it("projects an actionable running worker with roster, selection and controls", () => {
 		const panel = projectFleetWebPanel(baseInput());
@@ -266,6 +311,125 @@ describe("fleet web projection", () => {
 		assert.ok(capText("y".repeat(9000)).length <= FLEET_WEB_CAPS.maxTextLength);
 		assert.ok(capLabel("short").length < FLEET_WEB_CAPS.maxLabelLength);
 		assert.equal(stripAnsi("\x1b[31mhello\x1b[0m"), "hello");
+	});
+
+	it("strips ANSI and control sequences from every transcript-derived field", () => {
+		const transcript = {
+			path: "ignored",
+			truncated: false,
+			events: [
+				{ kind: "tool" as const, name: "\x1b[31mbash\x1b[0m", args: "echo \x1b]0;window-title\x07\x07secret \x00hidden", status: "error" as const, error: "boom \x1b[31mred\x1b[0m \x1b[3A" },
+				{ kind: "tool" as const, name: "\u009B31mcat\u009B0m", args: "\x08back\bspace", status: "complete" as const, output: "out \x1b[2K" },
+			],
+		};
+		const tail = plainTranscriptTail(transcript, { expandedTools: true });
+		assert.ok(!/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x80-\x9F]/.test(tail), "no control characters may cross the wire");
+		assert.ok(!tail.includes("\x1b"));
+		assert.ok(tail.includes("● bash echo secret hidden (error)"), "tool name and args must be stripped before they are surfaced");
+		assert.ok(tail.includes("boom red"), "tool errors must be stripped");
+		assert.ok(tail.includes("cat backspace (done)"));
+		assert.ok(tail.includes("out"), "tool output must be stripped");
+		assert.equal(stripAnsi("\x00a\x08b\x7f\x1b[31m\x9Bc"), "ab");
+	});
+
+	it("keeps the newest transcript events and marks omitted earlier activity", () => {
+		const events = Array.from({ length: 200 }, (_, index) => ({ kind: "notice" as const, text: `event ${index}`, tone: "muted" as const }));
+		const tail = plainTranscriptTail({ path: "ignored", truncated: false, events }, { maxChars: 5000, maxLines: 25 });
+		const lines = tail.split("\n");
+		assert.equal(lines.length, 25, "tail must respect the line cap");
+		assert.ok(lines[0].includes("Earlier activity omitted"), "omitted earlier activity must be visibly indicated");
+		assert.ok(tail.includes("event 199"), "newest event must be present");
+		assert.ok(!tail.includes("event 0"), "oldest event must be omitted");
+		const numbers = lines.slice(1).map((line) => Number(line.match(/event (\d+)/)?.[1]));
+		assert.deepEqual(numbers, [...numbers].sort((left, right) => left - right), "included groups must stay in chronological order");
+	});
+
+	it("prefers newest events under a tight char cap", () => {
+		const events = Array.from({ length: 50 }, (_, index) => ({ kind: "notice" as const, text: `event-${index}-content`, tone: "muted" as const }));
+		const tail = plainTranscriptTail({ path: "ignored", truncated: false, events }, { maxChars: 120, maxLines: 500 });
+		assert.ok(tail.length <= 120);
+		assert.ok(tail.includes("event-49-content"), "newest event must survive a tight char cap");
+		assert.ok(!tail.includes("event-0-content"), "oldest event must be omitted");
+		assert.ok(tail.includes("Earlier activity omitted"));
+	});
+
+	it("shows older activity when the newest event is too large to render", () => {
+		const events = [
+			{ kind: "notice" as const, text: "x".repeat(500), tone: "muted" as const },
+			{ kind: "notice" as const, text: "older small event", tone: "muted" as const },
+		];
+		const tail = plainTranscriptTail({ path: "ignored", truncated: false, events }, { maxChars: 80, maxLines: 50 });
+		assert.ok(tail.includes("older small event"), "older fitting activity must still be shown");
+		assert.ok(tail.includes("Earlier activity omitted"));
+		assert.ok(!tail.includes("x".repeat(500)));
+	});
+
+	it("caps roster ids, titles, subtitles and statuses at the label cap", () => {
+		const long = "y".repeat(300);
+		const panel = projectFleetWebPanel(baseInput({
+			roster: [{ id: long, title: long, subtitle: long, status: long }],
+			selectedId: long,
+		}));
+		const [item] = listOf(panel).items;
+		assert.ok(item.id.length <= FLEET_WEB_CAPS.maxLabelLength);
+		assert.ok(item.title.length <= FLEET_WEB_CAPS.maxLabelLength);
+		assert.ok((item.subtitle ?? "").length <= FLEET_WEB_CAPS.maxLabelLength);
+		assert.ok((item.status ?? "").length <= FLEET_WEB_CAPS.maxLabelLength);
+		assert.equal(listOf(panel).selectedId, item.id, "selected id must match the capped roster id");
+	});
+
+	it("caps the final composed prefixed notice instead of fragments", () => {
+		const panel = projectFleetWebPanel(baseInput({
+			scanError: "e".repeat(5000),
+			detail: { title: "worker · running", metrics: [{ label: "State", value: "running" }], transcriptTail: "tail" },
+		}));
+		const scanWarning = noticesOf(panel).find((notice) => notice.message.startsWith("Fleet scan warning:"));
+		assert.ok(scanWarning, "scan warning notice must be present");
+		assert.ok(scanWarning.message.length <= FLEET_WEB_CAPS.maxNoticeLength, "the final composed notice must be capped");
+		assert.ok(scanWarning.message.startsWith("Fleet scan warning:"));
+		assert.ok(capNotice("n".repeat(9000)).length <= FLEET_WEB_CAPS.maxNoticeLength);
+	});
+
+	it("disables all actions and omits the steer input while busy", () => {
+		const panel = projectFleetWebPanel(baseInput({
+			actionState: { busy: true, stopConfirming: false, expandedTools: false, hasControls: true, notice: { text: "Working…", isError: false } },
+		}));
+		assert.equal(steerInputOf(panel), undefined, "steer input must be omitted while an action is pending");
+		assert.ok(actionsOf(panel).length > 0);
+		assert.ok(actionsOf(panel).every((action) => action.disabled === true), "overlapping controls must be disabled while busy");
+		assert.ok(noticesOf(panel).some((notice) => notice.tone === "info" && notice.message.includes("Action pending")));
+	});
+
+	it("keeps a representative worst-case projection under the 64 KiB WebPanel payload cap", () => {
+		const panel = worstCaseProjection();
+		const serialized = JSON.stringify(panel);
+		const bytes = new TextEncoder().encode(serialized).length;
+		assert.ok(bytes < 64 * 1024, `worst-case projection must stay under 64 KiB (actual ${bytes} bytes)`);
+	});
+
+	it("validates representative fixtures through Pi Web's exact validator when available locally", async () => {
+		const validatorPath = piWebValidatorPath();
+		if (!validatorPath) {
+			console.log("Pi Web validator source not found locally; skipping exact-validator fixture check.");
+			return;
+		}
+		const { validateWebPanel } = await import(pathToFileURL(validatorPath).href);
+		const fixtures: FleetWebPanel[] = [
+			projectFleetWebPanel(baseInput()),
+			projectFleetWebPanel(baseInput({
+				roster: [],
+				selectedId: undefined,
+				detail: undefined,
+			})),
+			projectFleetWebPanel(baseInput({
+				actionState: { busy: false, stopConfirming: true, expandedTools: false, hasControls: true, stopConfirmMessage: "Confirm stop for async run run-a?" },
+			})),
+			worstCaseProjection(),
+		];
+		for (const fixture of fixtures) {
+			const result = validateWebPanel(fixture);
+			assert.ok(result.ok, `Pi Web rejected the fleet projection: ${result.ok ? "" : result.error}`);
+		}
 	});
 
 	it("never emits strings beyond the WebPanel caps from the full projection", () => {
@@ -569,6 +733,300 @@ describe("fleet web actions", () => {
 			const tail = plainTranscriptTail(transcript, {});
 			assert.ok(tail.includes("final answer"));
 			assert.ok(!tail.includes("undefined"));
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("shows the newest transcript activity with older events visibly omitted", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-web-tail-newest-"));
+		try {
+			const transcript: Array<Record<string, unknown>> = [];
+			for (let index = 0; index < 100; index++) {
+				transcript.push({ recordType: "message", role: "assistant", text: `message number ${index}`, model: "test-model" });
+			}
+			writeAsyncRun(root, { id: "run-a", agents: ["worker"], state: "running", transcript });
+			const state = stateForTest();
+			state.baseCwd = root;
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000 },
+			);
+			try {
+				const panel = component.getWebView() as FleetWebPanel;
+				const tail = textOf(panel)?.content ?? "";
+				assert.ok(tail.includes("message number 99"), "newest activity must be present in the live tail");
+				assert.ok(!tail.includes("message number 0"), "oldest activity must be omitted");
+				assert.ok(tail.includes("Earlier activity omitted"), "omitted older activity must be indicated");
+				const numbers = [...tail.matchAll(/message number (\d+)/g)].map((match) => Number(match[1]));
+				assert.ok(numbers.length > 1);
+				assert.deepEqual(numbers, [...numbers].sort((left, right) => left - right), "included events must remain in chronological order");
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps command output out of the collapsed transcript and exposes it when expanded", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-web-collapse-"));
+		try {
+			writeAsyncRun(root, {
+				id: "run-a",
+				agents: ["worker"],
+				state: "running",
+				transcript: [
+					{ recordType: "tool_start", toolName: "bash", argsPreview: "echo top-secret" },
+					{ recordType: "tool_end", toolName: "bash" },
+					{ recordType: "message", role: "toolResult", toolName: "bash", text: "top-secret value 42\nmore output", isError: false },
+				],
+			});
+			const state = stateForTest();
+			state.baseCwd = root;
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000 },
+			);
+			try {
+				const collapsed = component.getWebView() as FleetWebPanel;
+				const collapsedContent = textOf(collapsed)?.content ?? "";
+				assert.ok(collapsedContent.includes("echo top-secret"), "tool name and args remain visible when collapsed");
+				assert.ok(!collapsedContent.includes("top-secret value 42"), "collapsed tools must not expose command output");
+				assert.ok(!collapsedContent.includes("more output"));
+				component.handleWebAction({ actionId: FLEET_WEB_ACTION_TOOLS });
+				const expanded = component.getWebView() as FleetWebPanel;
+				const expandedContent = textOf(expanded)?.content ?? "";
+				assert.ok(expandedContent.includes("top-secret value 42"), "expanded tools may show command output");
+				assert.ok(expandedContent.includes("more output"));
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("omits the filesystem path from web foreground activity", () => {
+		const state = stateForTest();
+		state.baseCwd = process.cwd();
+		state.foregroundControls.set("fg-run-1", {
+			runId: "fg-run-1",
+			mode: "single",
+			startedAt: 100,
+			updatedAt: 200,
+			cwd: process.cwd(),
+			currentAgent: "worker",
+			currentIndex: 0,
+			activeChildren: new Map([[0, {
+				index: 0,
+				agent: "worker",
+				startedAt: 100,
+				updatedAt: 200,
+				currentTool: "read",
+				currentPath: "C:/Users/thoma/secret/project/src/index.ts",
+			}]]),
+		} as never);
+		const component = new SubagentFleetComponent(
+			{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+			theme as never,
+			state,
+			() => {},
+			{ refreshMs: 60_000 },
+		);
+		try {
+			const panel = component.getWebView() as FleetWebPanel;
+			const activity = metricsOf(panel).find((metric) => metric.label === "Activity");
+			assert.ok(activity, "foreground activity metric must be present");
+			assert.equal(activity.value, "read");
+			assert.ok(!JSON.stringify(panel).includes("secret/project"), "the web projection must never expose the filesystem path");
+		} finally {
+			component.dispose();
+		}
+	});
+
+	it("never stops a different worker when the run vanishes before confirm", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-web-stop-vanish-"));
+		try {
+			writeAsyncRun(root, { id: "run-a", agents: ["worker", "reviewer"] });
+			writeAsyncRun(root, { id: "run-b" });
+			const state = stateForTest();
+			const calls: Array<{ runId: string; index?: number }> = [];
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{
+					asyncDirRoot: root,
+					resultsDir: path.join(root, "results"),
+					refreshMs: 60_000,
+					actions: {
+						async steer() {
+							return { text: "unused" };
+						},
+						stop(input) {
+							calls.push({ runId: input.runId, index: input.index });
+							return { text: "Stop requested." };
+						},
+					},
+				},
+			);
+			try {
+				component.handleWebAction({ actionId: FLEET_WEB_ACTION_STOP });
+				assert.deepEqual(calls, []);
+				// A timer/manual refresh happens while the confirmation is open and
+				// the confirmed run disappears from the fleet snapshot.
+				fs.rmSync(path.join(root, "run-a"), { recursive: true, force: true });
+				component.invalidate();
+				const panel = component.getWebView() as FleetWebPanel;
+				assert.ok(noticesOf(panel).some((notice) => notice.tone === "error" && notice.message.includes("cancelled")), "refresh must cancel the stale confirmation with an explicit notice");
+				assert.ok(!noticesOf(panel).some((notice) => notice.message.includes("Confirm stop")), "the stale confirmation UI must be gone");
+				component.handleWebAction({ actionId: FLEET_WEB_ACTION_STOP_CONFIRM });
+				await new Promise((resolve) => setImmediate(resolve));
+				assert.deepEqual(calls, [], "confirm after the run vanished must never stop another worker");
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a stop confirm when the run stopped being actionable before confirm", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-web-stop-completed-"));
+		try {
+			writeAsyncRun(root, { id: "run-a", agents: ["worker", "reviewer"] });
+			const state = stateForTest();
+			const calls: Array<{ runId: string }> = [];
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{
+					asyncDirRoot: root,
+					resultsDir: path.join(root, "results"),
+					refreshMs: 60_000,
+					actions: {
+						async steer() {
+							return { text: "unused" };
+						},
+						stop(input) {
+							calls.push({ runId: input.runId });
+							return { text: "Stop requested." };
+						},
+					},
+				},
+			);
+			try {
+				component.handleWebAction({ actionId: FLEET_WEB_ACTION_STOP });
+				// The run completes (same key/runId) while the confirmation is open.
+				writeAsyncRun(root, { id: "run-a", agents: ["worker", "reviewer"], state: "complete" });
+				component.invalidate();
+				const beforeConfirm = component.getWebView() as FleetWebPanel;
+				assert.ok(noticesOf(beforeConfirm).some((notice) => notice.message.includes("Confirm stop")), "the confirmation stays while the run identity is intact");
+				component.handleWebAction({ actionId: FLEET_WEB_ACTION_STOP_CONFIRM });
+				await new Promise((resolve) => setImmediate(resolve));
+				assert.deepEqual(calls, [], "a completed run must never be stopped");
+				const afterConfirm = component.getWebView() as FleetWebPanel;
+				assert.ok(noticesOf(afterConfirm).some((notice) => notice.tone === "error" && notice.message.includes("controls require")), "the rejection must carry an explicit notice");
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("cancels the stop confirmation when the user reselects before confirm", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-web-stop-reselect-"));
+		try {
+			writeAsyncRun(root, { id: "run-a", agents: ["worker", "reviewer"] });
+			writeAsyncRun(root, { id: "run-b" });
+			const state = stateForTest();
+			const calls: Array<{ runId: string }> = [];
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{
+					asyncDirRoot: root,
+					resultsDir: path.join(root, "results"),
+					refreshMs: 60_000,
+					actions: {
+						async steer() {
+							return { text: "unused" };
+						},
+						stop(input) {
+							calls.push({ runId: input.runId });
+							return { text: "Stop requested." };
+						},
+					},
+				},
+			);
+			try {
+				component.handleWebAction({ actionId: FLEET_WEB_ACTION_STOP });
+				component.handleWebAction({ actionId: "async:run-b:0" });
+				const reselected = component.getWebView() as FleetWebPanel;
+				assert.equal(listOf(reselected).selectedId, "async:run-b:0");
+				assert.ok(!noticesOf(reselected).some((notice) => notice.message.includes("Confirm stop")), "reselection must cancel the confirmation");
+				component.handleWebAction({ actionId: FLEET_WEB_ACTION_STOP_CONFIRM });
+				await new Promise((resolve) => setImmediate(resolve));
+				assert.deepEqual(calls, [], "a stale confirm after reselection must never stop another worker");
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("still stops the bound run after a harmless refresh while confirming", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-web-stop-fresh-"));
+		try {
+			writeAsyncRun(root, { id: "run-a", agents: ["worker", "reviewer"] });
+			writeAsyncRun(root, { id: "run-b" });
+			const state = stateForTest();
+			const calls: Array<{ runId: string; index?: number }> = [];
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{
+					asyncDirRoot: root,
+					resultsDir: path.join(root, "results"),
+					refreshMs: 60_000,
+					actions: {
+						async steer() {
+							return { text: "unused" };
+						},
+						stop(input) {
+							calls.push({ runId: input.runId, index: input.index });
+							return { text: "Stop requested." };
+						},
+					},
+				},
+			);
+			try {
+				component.handleWebAction({ actionId: FLEET_WEB_ACTION_STOP });
+				component.invalidate();
+				const stillOpen = component.getWebView() as FleetWebPanel;
+				assert.ok(noticesOf(stillOpen).some((notice) => notice.message.includes("Confirm stop")), "a harmless refresh must keep the confirmation");
+				component.handleWebAction({ actionId: FLEET_WEB_ACTION_STOP_CONFIRM });
+				await new Promise((resolve) => setImmediate(resolve));
+				assert.deepEqual(calls, [{ runId: "run-a", index: 0 }], "the originally confirmed run must be stopped");
+			} finally {
+				component.dispose();
+			}
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

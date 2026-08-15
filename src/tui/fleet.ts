@@ -14,7 +14,7 @@ import { stopAsyncRun } from "../runs/foreground/async-stop-action.ts";
 import { contextModeBadge, contextModeLabel } from "../runs/shared/context-mode.ts";
 import { FLEET_STATUS_WIDGET_KEY } from "./fleet-status.ts";
 import { readFleetTranscript, renderFleetTranscript, type FleetTranscript } from "./fleet-transcript.ts";
-import { capLabel, plainTranscriptTail, projectFleetWebPanel, FLEET_WEB_ACTION_REFRESH, FLEET_WEB_ACTION_STEER, FLEET_WEB_ACTION_STOP, FLEET_WEB_ACTION_STOP_CANCEL, FLEET_WEB_ACTION_STOP_CONFIRM, FLEET_WEB_ACTION_TOOLS, type FleetWebMetricItem, type FleetWebPanelInput } from "./fleet-web.ts";
+import { capLabel, plainTranscriptTail, projectFleetWebPanel, stripAnsi, FLEET_WEB_ACTION_REFRESH, FLEET_WEB_ACTION_STEER, FLEET_WEB_ACTION_STOP, FLEET_WEB_ACTION_STOP_CANCEL, FLEET_WEB_ACTION_STOP_CONFIRM, FLEET_WEB_ACTION_TOOLS, type FleetWebMetricItem, type FleetWebPanelInput } from "./fleet-web.ts";
 
 const REFRESH_MS = 750;
 const MAX_RECENT_ASYNC_RUNS = 20;
@@ -410,7 +410,7 @@ function conversationStateOf(transcript: FleetTranscript): string {
 	const latest = transcript.events.at(-1);
 	if (latest?.kind === "assistant") return "assistant response";
 	if (latest?.kind === "user") return "supervisor message";
-	if (latest?.kind === "tool") return `${latest.name} · ${latest.status}`;
+	if (latest?.kind === "tool") return `${stripAnsi(latest.name)} · ${latest.status}`;
 	return "activity";
 }
 
@@ -495,6 +495,11 @@ export class SubagentFleetComponent implements Component {
 	private actionNotice: FleetActionResult | undefined;
 	private steerDraft: string | undefined;
 	private stopConfirming = false;
+	/** Identity of the run the stop confirmation was opened for; used to make
+	 *  sure a confirm can never retarget a different worker after a live
+	 *  refresh or selection change. */
+	private stopConfirmKey: string | undefined;
+	private stopConfirmRunId: string | undefined;
 	private actionBusy = false;
 	private transcriptCache: FleetTranscriptCache | undefined;
 	private disposed = false;
@@ -535,6 +540,21 @@ export class SubagentFleetComponent implements Component {
 		const preserved = previousKey ? this.snapshot.items.findIndex((item) => item.key === previousKey) : -1;
 		this.selected = preserved >= 0 ? preserved : Math.min(this.selected, Math.max(0, this.snapshot.items.length - 1));
 		this.selectedKey = this.snapshot.items[this.selected]?.key;
+		this.reconcileStopConfirmation();
+	}
+
+	/** Cancel a pending stop confirmation when the confirmed run is no longer
+	 *  the selected item (a timer or manual refresh replaced or removed it).
+	 *  The explicit notice guarantees a confirm can never stop another worker. */
+	private reconcileStopConfirmation(): void {
+		if (!this.stopConfirming) return;
+		const selected = this.snapshot.items[this.selected];
+		if (!selected || selected.key !== this.stopConfirmKey || selected.runId !== this.stopConfirmRunId) {
+			this.resetActionInput();
+			this.actionNotice = { text: "The selected run changed or is no longer available. Stop confirmation was cancelled.", isError: true };
+			this.detailAutoFollow = false;
+			this.detailScroll = 0;
+		}
 	}
 
 	private moveSelection(delta: number): void {
@@ -549,6 +569,8 @@ export class SubagentFleetComponent implements Component {
 	private resetActionInput(): void {
 		this.steerDraft = undefined;
 		this.stopConfirming = false;
+		this.stopConfirmKey = undefined;
+		this.stopConfirmRunId = undefined;
 	}
 
 	private selectedAsyncAction(): { item: Extract<FleetItem, { kind: "async" }> } | { reason: string } {
@@ -611,15 +633,28 @@ export class SubagentFleetComponent implements Component {
 		}
 		this.actionNotice = undefined;
 		this.stopConfirming = true;
+		// Bind the confirmation to the exact item identity captured now; a
+		// confirm later re-verifies it before any stop is sent.
+		this.stopConfirmKey = target.item.key;
+		this.stopConfirmRunId = target.item.runId;
 		this.detailAutoFollow = false;
 		this.detailScroll = 0;
 		this.tui.requestRender();
 	}
 
 	private confirmStop(): void {
+		if (!this.stopConfirming || !this.options.actions) {
+			this.resetActionInput();
+			return;
+		}
+		const selected = this.snapshot.items[this.selected];
+		if (!selected || selected.key !== this.stopConfirmKey || selected.runId !== this.stopConfirmRunId) {
+			this.setActionNotice({ text: "The selected run changed or is no longer available. Stop was not sent.", isError: true });
+			return;
+		}
 		const target = this.selectedAsyncAction();
-		if ("reason" in target || !this.options.actions) {
-			this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
+		if ("reason" in target) {
+			this.setActionNotice({ text: target.reason, isError: true });
 			return;
 		}
 		this.runAction(() => Promise.resolve(this.options.actions!.stop({ runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}) })));
@@ -632,10 +667,10 @@ export class SubagentFleetComponent implements Component {
 	getWebView(): unknown {
 		const selected = this.snapshot.items[this.selected];
 		const roster = this.snapshot.items.map((item) => ({
-			id: item.key,
-			title: item.agent,
+			id: capLabel(item.key),
+			title: capLabel(item.agent),
 			subtitle: capLabel(item.description?.replace(/\s+/g, " ").trim() || item.runId.slice(0, 8)),
-			status: item.state,
+			status: capLabel(item.state),
 		}));
 		const input: FleetWebPanelInput = {
 			roster,
@@ -662,7 +697,9 @@ export class SubagentFleetComponent implements Component {
 			}
 			if (selected.kind === "foreground-active") {
 				const live = selected.activeChild ?? selected.control;
-				activity = live.currentTool ? (live.currentPath ? `${live.currentTool} · ${shortenPath(live.currentPath)}` : live.currentTool) : "running";
+				// The web projection deliberately omits the filesystem path; only
+				// the current tool name is surfaced as activity.
+				activity = live.currentTool ? live.currentTool : "running";
 			} else if (activity === "activity") {
 				activity = undefined;
 			}
@@ -681,7 +718,7 @@ export class SubagentFleetComponent implements Component {
 				...input.actionState,
 				hasControls,
 				...(controlsReason ? { controlsReason } : {}),
-				...(this.stopConfirming ? { stopConfirmMessage: `Confirm stop for async run ${selected.runId}? Stop ends the run; use interrupt for a resumable pause.` } : {}),
+				...(this.stopConfirming ? { stopConfirmMessage: `Confirm stop for async run ${this.stopConfirmRunId ?? selected.runId}? Stop ends the run; use interrupt for a resumable pause.` } : {}),
 			};
 		}
 		return projectFleetWebPanel(input);
@@ -691,6 +728,10 @@ export class SubagentFleetComponent implements Component {
 	 *  through existing safe methods (runAction / steer / stop / refresh).
 	 *  Unknown or stale action ids are ignored. */
 	handleWebAction(action: { actionId: string; payload?: Record<string, string | number | boolean | null> }): void {
+		// While an action is pending, every overlapping control is disabled or
+		// omitted from the projection; ignore any stale action that still
+		// arrives until the pending action settles.
+		if (this.actionBusy) return;
 		const { actionId, payload } = action;
 		const rosterIndex = this.snapshot.items.findIndex((item) => item.key === actionId);
 		if (rosterIndex >= 0) {
