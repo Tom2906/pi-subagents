@@ -14,6 +14,7 @@ import { stopAsyncRun } from "../runs/foreground/async-stop-action.ts";
 import { contextModeBadge, contextModeLabel } from "../runs/shared/context-mode.ts";
 import { FLEET_STATUS_WIDGET_KEY } from "./fleet-status.ts";
 import { readFleetTranscript, renderFleetTranscript, type FleetTranscript } from "./fleet-transcript.ts";
+import { capLabel, plainTranscriptTail, projectFleetWebPanel, FLEET_WEB_ACTION_REFRESH, FLEET_WEB_ACTION_STEER, FLEET_WEB_ACTION_STOP, FLEET_WEB_ACTION_STOP_CANCEL, FLEET_WEB_ACTION_STOP_CONFIRM, FLEET_WEB_ACTION_TOOLS, type FleetWebMetricItem, type FleetWebPanelInput } from "./fleet-web.ts";
 
 const REFRESH_MS = 750;
 const MAX_RECENT_ASYNC_RUNS = 20;
@@ -405,6 +406,30 @@ function itemStats(item: FleetItem): string[] {
 	].filter((value): value is string => Boolean(value));
 }
 
+function conversationStateOf(transcript: FleetTranscript): string {
+	const latest = transcript.events.at(-1);
+	if (latest?.kind === "assistant") return "assistant response";
+	if (latest?.kind === "user") return "supervisor message";
+	if (latest?.kind === "tool") return `${latest.name} · ${latest.status}`;
+	return "activity";
+}
+
+function webDetailMetrics(item: FleetItem, activity: string | undefined): FleetWebMetricItem[] {
+	const metrics: FleetWebMetricItem[] = [];
+	if (item.description) metrics.push({ label: "Task", value: capLabel(item.description.replace(/\s+/g, " ").trim()) });
+	metrics.push({ label: "State", value: capLabel(item.state) });
+	metrics.push({ label: "Source", value: capLabel(itemSource(item)) });
+	const [model, tokens, tools, runtime] = itemStats(item);
+	if (model) metrics.push({ label: "Model", value: capLabel(model) });
+	if (tokens) metrics.push({ label: "Tokens", value: capLabel(tokens) });
+	if (tools) metrics.push({ label: "Tools", value: capLabel(tools) });
+	if (runtime) metrics.push({ label: "Runtime", value: capLabel(runtime) });
+	const context = itemContext(item);
+	if (context) metrics.push({ label: "Context", value: capLabel(context) });
+	if (activity) metrics.push({ label: "Activity", value: capLabel(activity) });
+	return metrics;
+}
+
 function structuredHeader(item: FleetItem, width: number, theme: Theme, conversationState: string): string[] {
 	const lines: string[] = [];
 	lines.push(rightAligned(` ${statusGlyph(item, theme)} ${theme.bold(item.agent)}`, theme.fg("dim", item.state), width));
@@ -464,6 +489,7 @@ export class SubagentFleetComponent implements Component {
 	private detailAutoFollow = true;
 	private detailLineCount = 0;
 	private detailViewportHeight = 8;
+	private detailWidth = 100;
 	private bodyHeight = 8;
 	private expandedTools = false;
 	private actionNotice: FleetActionResult | undefined;
@@ -577,6 +603,145 @@ export class SubagentFleetComponent implements Component {
 			});
 	}
 
+	private enterStopConfirm(): void {
+		const target = this.selectedAsyncAction();
+		if ("reason" in target || !this.options.actions) {
+			this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
+			return;
+		}
+		this.actionNotice = undefined;
+		this.stopConfirming = true;
+		this.detailAutoFollow = false;
+		this.detailScroll = 0;
+		this.tui.requestRender();
+	}
+
+	private confirmStop(): void {
+		const target = this.selectedAsyncAction();
+		if ("reason" in target || !this.options.actions) {
+			this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
+			return;
+		}
+		this.runAction(() => Promise.resolve(this.options.actions!.stop({ runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}) })));
+	}
+
+	/** Duck-typed WebPanel v1 structured projection. Called synchronously by
+	 *  Pi Web after every render; tui.requestRender() therefore always yields a
+	 *  fresh projection. Returns undefined-like-safe data only; Pi Web's
+	 *  validator is the source of truth for the JSON-safe shape. */
+	getWebView(): unknown {
+		const selected = this.snapshot.items[this.selected];
+		const roster = this.snapshot.items.map((item) => ({
+			id: item.key,
+			title: item.agent,
+			subtitle: capLabel(item.description?.replace(/\s+/g, " ").trim() || item.runId.slice(0, 8)),
+			status: item.state,
+		}));
+		const input: FleetWebPanelInput = {
+			roster,
+			...(this.selectedKey !== undefined ? { selectedId: this.selectedKey } : {}),
+			actionState: {
+				busy: this.actionBusy,
+				...(this.actionNotice ? { notice: { text: this.actionNotice.text, isError: this.actionNotice.isError === true } } : {}),
+				stopConfirming: this.stopConfirming,
+				expandedTools: this.expandedTools,
+				hasControls: false,
+			},
+			...(this.snapshot.error ? { scanError: this.snapshot.error } : {}),
+		};
+		if (selected) {
+			const target = transcriptTarget(selected, this.state);
+			let transcriptWarning: string | undefined;
+			let transcriptTail: string | undefined;
+			let activity: string | undefined;
+			if (target) {
+				const { transcript } = this.renderedTranscript(target, this.detailWidth);
+				transcriptWarning = transcript.warning;
+				transcriptTail = plainTranscriptTail(transcript, { expandedTools: this.expandedTools });
+				activity = conversationStateOf(transcript);
+			}
+			if (selected.kind === "foreground-active") {
+				const live = selected.activeChild ?? selected.control;
+				activity = live.currentTool ? (live.currentPath ? `${live.currentTool} · ${shortenPath(live.currentPath)}` : live.currentTool) : "running";
+			} else if (activity === "activity") {
+				activity = undefined;
+			}
+			const actionable = this.selectedAsyncAction();
+			const hasControls = "item" in actionable && Boolean(this.options.actions);
+			const controlsReason = "item" in actionable
+				? (this.options.actions ? undefined : "Fleet controls are unavailable in this context.")
+				: actionable.reason;
+			input.detail = {
+				title: `${selected.agent} · ${selected.state}`,
+				metrics: webDetailMetrics(selected, activity),
+				...(transcriptWarning !== undefined ? { transcriptWarning } : {}),
+				...(transcriptTail !== undefined ? { transcriptTail } : {}),
+			};
+			input.actionState = {
+				...input.actionState,
+				hasControls,
+				...(controlsReason ? { controlsReason } : {}),
+				...(this.stopConfirming ? { stopConfirmMessage: `Confirm stop for async run ${selected.runId}? Stop ends the run; use interrupt for a resumable pause.` } : {}),
+			};
+		}
+		return projectFleetWebPanel(input);
+	}
+
+	/** Semantic action handler for the WebPanel v1 projection. Routes only
+	 *  through existing safe methods (runAction / steer / stop / refresh).
+	 *  Unknown or stale action ids are ignored. */
+	handleWebAction(action: { actionId: string; payload?: Record<string, string | number | boolean | null> }): void {
+		const { actionId, payload } = action;
+		const rosterIndex = this.snapshot.items.findIndex((item) => item.key === actionId);
+		if (rosterIndex >= 0) {
+			if (rosterIndex === this.selected) return;
+			this.selected = rosterIndex;
+			this.selectedKey = this.snapshot.items[rosterIndex]?.key;
+			this.detailAutoFollow = true;
+			this.resetActionInput();
+			this.tui.requestRender();
+			return;
+		}
+		switch (actionId) {
+			case FLEET_WEB_ACTION_REFRESH:
+				this.transcriptCache = undefined;
+				this.refresh();
+				this.tui.requestRender();
+				return;
+			case FLEET_WEB_ACTION_TOOLS:
+				this.expandedTools = !this.expandedTools;
+				this.transcriptCache = undefined;
+				this.tui.requestRender();
+				return;
+			case FLEET_WEB_ACTION_STEER: {
+				const message = typeof payload?.value === "string" ? payload.value.trim() : "";
+				if (!message) {
+					this.setActionNotice({ text: "Steer message cannot be empty.", isError: true });
+					return;
+				}
+				const target = this.selectedAsyncAction();
+				if ("reason" in target || !this.options.actions) {
+					this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
+					return;
+				}
+				this.runAction(() => this.options.actions!.steer({ runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}), message }));
+				return;
+			}
+			case FLEET_WEB_ACTION_STOP:
+				this.enterStopConfirm();
+				return;
+			case FLEET_WEB_ACTION_STOP_CANCEL:
+				this.resetActionInput();
+				this.tui.requestRender();
+				return;
+			case FLEET_WEB_ACTION_STOP_CONFIRM:
+				this.confirmStop();
+				return;
+			default:
+				return;
+		}
+	}
+
 	private scrollDetail(delta: number): void {
 		const maxScroll = Math.max(0, this.detailLineCount - this.detailViewportHeight);
 		this.detailScroll = Math.max(0, Math.min(maxScroll, this.detailScroll + delta));
@@ -618,12 +783,7 @@ export class SubagentFleetComponent implements Component {
 		}
 		if (this.stopConfirming) {
 			if (matchesKey(data, "return") || data.toLowerCase() === "y") {
-				const target = this.selectedAsyncAction();
-				if ("reason" in target || !this.options.actions) {
-					this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
-					return;
-				}
-				this.runAction(() => Promise.resolve(this.options.actions!.stop({ runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}) })));
+				this.confirmStop();
 				return;
 			}
 			if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || data.toLowerCase() === "n" || matchesKey(data, "backspace")) {
@@ -663,15 +823,7 @@ export class SubagentFleetComponent implements Component {
 			return;
 		}
 		if (data === "D") {
-			const target = this.selectedAsyncAction();
-			if ("reason" in target || !this.options.actions) this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
-			else {
-				this.actionNotice = undefined;
-				this.stopConfirming = true;
-				this.detailAutoFollow = false;
-				this.detailScroll = 0;
-				this.tui.requestRender();
-			}
+			this.enterStopConfirm();
 			return;
 		}
 		if (data.toLowerCase() === "x" || matchesKey(data, "ctrl+o")) {
@@ -722,14 +874,7 @@ export class SubagentFleetComponent implements Component {
 				transcriptWarning = transcript.warning;
 				if (transcript.events.length > 0) {
 					if (this.snapshot.error) body.unshift(this.theme.fg("warning", `Fleet scan warning: ${this.snapshot.error}`), "");
-					const latest = transcript.events.at(-1);
-					const conversationState = latest?.kind === "assistant"
-						? "assistant response"
-						: latest?.kind === "user"
-							? "supervisor message"
-							: latest?.kind === "tool"
-								? `${latest.name} · ${latest.status}`
-								: "activity";
+					const conversationState = conversationStateOf(transcript);
 					return { header: structuredHeader(selected, width, this.theme, conversationState), body: this.withActionLines(body) };
 				}
 			}
@@ -761,6 +906,7 @@ export class SubagentFleetComponent implements Component {
 		this.bodyHeight = Math.max(2, Math.min(30, Math.floor(rows * 0.85) - 6));
 		const rosterWidth = Math.max(22, Math.min(46, Math.floor((innerWidth - 1) * 0.38)));
 		const detailWidth = Math.max(1, innerWidth - rosterWidth - 1);
+		this.detailWidth = detailWidth;
 		const roster = this.rosterLines(rosterWidth);
 		const detail = this.wrappedDetail(detailWidth);
 		const detailHeader = detail.header.slice(0, Math.max(0, this.bodyHeight - 1));
